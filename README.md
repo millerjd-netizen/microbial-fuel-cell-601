@@ -31,7 +31,7 @@ This system monitors pH, electrical conductivity (EC), and oxidation-reduction p
 The system uses prioritized control with cross-correction:
 
 1. **Critical Safety Check**: If EC > 10.0 mS/cm, all dosing halts to prevent salt toxicity
-2. **pH Control** (Priority 1): Sodium bicarbonate or citric acid
+2. **pH Control** (Priority 1): Calcium Oxide or citric acid
 3. **EC Control** (Priority 2): Nutrients or dilution
 4. **ORP Control** (Priority 3): Oxidation/reduction balance
 
