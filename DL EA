@@ -1,0 +1,472 @@
+#include <math.h>  // fabs()
+
+// Recalibrated: Automated Dosing Control Logic + EA (evolutionary algorithm) + DL-stub predictor
+// Arduino GIGA R1
+// ======================================================
+// - Your existing safety + priority logic decides WHICH pump.
+// - EA + (tiny DL predictor stub) decides HOW LONG to run that pump.
+// - After dosing, the code auto-tunes that pump's baseline pulse (+1s / -1s behavior).
+
+// ------------ Pump Pins (Active HIGH) ------------
+const int PUMP_SODIUM_BICARB   = 2; // Raise pH (raises EC)
+const int PUMP_CITRIC_ACID     = 3; // Lower pH
+const int PUMP_DEIONIZED_WATER = 4; // Lower EC / raise ORP (dilution)
+const int PUMP_MOLASSES        = 5; // Lower ORP / raise EC (food)
+const int PUMP_URINE           = 6; // Raise EC / pH (nutrient)
+const int PUMP_SPIRULINA       = 7; // Raise EC / pH (nutrient)
+
+// ------------ Timing ------------
+const unsigned long DOSING_INTERVAL_MS = 300000; // 5 min
+const unsigned long SENSOR_INTERVAL    = 5000;   // 5 sec
+
+// ------------ Sensor Pins ------------
+const int PH_PIN   = A0;
+const int ORP_PIN  = A1;
+const int EC_PIN   = A2;
+const int MFC_PIN  = A3; // read but ignored for control logic
+
+// ------------ System Target Ranges ------------
+const float TARGET_PH_L = 6.8;
+const float TARGET_PH_H = 7.2;
+
+const float TARGET_EC_L = 4.0; // mS/cm
+const float TARGET_EC_H = 5.0; // mS/cm
+
+const float CRITICAL_EC_H = 10.0; // halt all dosing above this (salt toxicity guardrail)
+
+// ORP range (more negative = more reducing)
+const float TARGET_ORP_L = -250.0; // most negative limit (healthy)
+const float TARGET_ORP_H = -150.0; // least negative limit (stressed)
+
+// ------------ Calibration Constants ------------
+const float VREF   = 3.3;
+const int   ADC_MAX = 4095;
+
+const float PH_SLOPE     = -5.59047;
+const float PH_INTERCEPT = 15.835;
+
+const float EC_SLOPE_MSPERMV = 0.00864;
+const float EC_OFFSET_MS     = 0.033;
+
+const float ORP_OFFSET = -1524.0;
+const int ORP_OVERSAMPLES = 50;
+
+// ------------ Timing Variables ------------
+unsigned long lastDosingTime = 0;
+unsigned long lastSensorRead = 0;
+
+// ======================================================
+// Data type
+// ======================================================
+struct SensorData {
+  float pH;
+  float EC_mS;
+  float ORP_mV;
+  float MFC_mV;
+};
+
+// ======================================================
+// Adaptive dosing configuration (per pump)
+// ======================================================
+const int PUMP_COUNT = 6;
+
+const int pumpPins[PUMP_COUNT] = {
+  PUMP_SODIUM_BICARB,
+  PUMP_CITRIC_ACID,
+  PUMP_DEIONIZED_WATER,
+  PUMP_MOLASSES,
+  PUMP_URINE,
+  PUMP_SPIRULINA
+};
+
+// Baseline pulse per pump (auto-tuned over time)
+unsigned long pumpPulseMs[PUMP_COUNT] = {1000, 1000, 1000, 1000, 1000, 1000};
+
+// Limits + step size for baseline tuning
+const unsigned long PULSE_STEP_MS = 1000;
+const unsigned long PULSE_MIN_MS  = 500;
+const unsigned long PULSE_MAX_MS  = 8000;
+
+// After dosing, wait for mixing before judging effect (tune this)
+const unsigned long POST_DOSE_MIX_MS = 20000; // 20 seconds
+
+// "Not enough change" thresholds (tune to your sensor noise)
+const float MIN_PH_DELTA  = 0.02;  // pH units
+const float MIN_EC_DELTA  = 0.02;  // mS/cm
+const float MIN_ORP_DELTA = 5.0;   // mV
+
+// "Too big change" thresholds (tune to prevent overshoot)
+const float MAX_PH_DELTA  = 0.15;  // pH units
+const float MAX_EC_DELTA  = 0.30;  // mS/cm
+const float MAX_ORP_DELTA = 40.0;  // mV
+
+// ======================================================
+// Forward Declarations
+// ======================================================
+SensorData readSensors();
+void readAndPrintSensors();
+void executeControlLogic();
+
+int  pumpIndexFromPin(int pumpPin);
+void Actuate_Pump_Adaptive_EA_DL(int pumpPin, const char* message, const SensorData& before);
+
+// EA + DL-stub functions
+SensorData predictDelta_DL_stub(int pumpPin, unsigned long pulseMs, const SensorData& s);
+float fitnessCost(const SensorData& predicted);
+unsigned long choosePulse_EA(int pumpPin, const SensorData& current);
+
+// ======================================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("Starting Automated Dosing Control (EA + DL-stub)...");
+  Serial.println("EC CRITICAL LIMIT SET: 10.0 mS/cm (Dosing will halt above this!)");
+
+  analogReadResolution(12);
+
+  pinMode(PUMP_SODIUM_BICARB, OUTPUT);
+  pinMode(PUMP_CITRIC_ACID, OUTPUT);
+  pinMode(PUMP_DEIONIZED_WATER, OUTPUT);
+  pinMode(PUMP_MOLASSES, OUTPUT);
+  pinMode(PUMP_URINE, OUTPUT);
+  pinMode(PUMP_SPIRULINA, OUTPUT);
+
+  digitalWrite(PUMP_SODIUM_BICARB, LOW);
+  digitalWrite(PUMP_CITRIC_ACID, LOW);
+  digitalWrite(PUMP_DEIONIZED_WATER, LOW);
+  digitalWrite(PUMP_MOLASSES, LOW);
+  digitalWrite(PUMP_URINE, LOW);
+  digitalWrite(PUMP_SPIRULINA, LOW);
+
+  // Seed RNG for EA (use floating analog pin noise)
+  randomSeed(analogRead(A5) + micros());
+
+  lastDosingTime = millis() - DOSING_INTERVAL_MS; // force first dosing attempt immediately
+}
+
+// ======================================================
+void loop() {
+  unsigned long currentTime = millis();
+
+  // 1) Sensor streaming
+  if (currentTime - lastSensorRead >= SENSOR_INTERVAL) {
+    readAndPrintSensors();
+    lastSensorRead = currentTime;
+  }
+
+  // 2) Control dosing loop
+  if (currentTime - lastDosingTime >= DOSING_INTERVAL_MS) {
+    executeControlLogic();
+    lastDosingTime = currentTime;
+  }
+}
+
+// ======================================================
+// Sensor Reading
+// ======================================================
+SensorData readSensors() {
+  SensorData data;
+
+  // pH
+  int ph_raw = analogRead(PH_PIN);
+  float ph_voltage = ph_raw * (VREF / ADC_MAX);
+  data.pH = PH_SLOPE * ph_voltage + PH_INTERCEPT;
+
+  // ORP
+  long sum = 0;
+  for (int i = 0; i < ORP_OVERSAMPLES; i++) {
+    sum += analogRead(ORP_PIN);
+    delayMicroseconds(100);
+  }
+  float orp_raw = sum / (float)ORP_OVERSAMPLES;
+  float orp_mV = (orp_raw * VREF / ADC_MAX) * 1000.0;
+  data.ORP_mV = orp_mV + ORP_OFFSET;
+
+  // EC
+  int ec_raw = analogRead(EC_PIN);
+  float ec_mV = (float)ec_raw * 3300.0 / 4095.0;
+  data.EC_mS = EC_SLOPE_MSPERMV * ec_mV + EC_OFFSET_MS;
+
+  // MFC
+  int mfc_raw = analogRead(MFC_PIN);
+  data.MFC_mV = (float)mfc_raw * 3300.0 / 4095.0;
+
+  return data;
+}
+
+void readAndPrintSensors() {
+  SensorData data = readSensors();
+  Serial.print("pH: ");       Serial.print(data.pH, 2);
+  Serial.print(" | ORP: ");   Serial.print(data.ORP_mV, 1);
+  Serial.print(" | EC: ");    Serial.print(data.EC_mS, 3);
+  Serial.print(" | MFC: ");   Serial.println(data.MFC_mV, 1);
+}
+
+// ======================================================
+// Control Logic (your same priority order)
+// ======================================================
+void executeControlLogic() {
+  SensorData data = readSensors();
+  Serial.println("--- Starting Dosing Check ---");
+
+  // Priority 0: critical EC cutoff
+  if (data.EC_mS > CRITICAL_EC_H) {
+    Serial.println("!!! CRITICAL EC WARNING !!!");
+    Serial.print("EC ("); Serial.print(data.EC_mS, 2);
+    Serial.print(") > CRITICAL ("); Serial.print(CRITICAL_EC_H, 1);
+    Serial.println("). HALTING ALL DOSING.");
+    Serial.println("Manual intervention REQUIRED to dilute contents.");
+    return;
+  }
+
+  // Priority 1: pH
+  if (data.pH < TARGET_PH_L) {
+    Actuate_Pump_Adaptive_EA_DL(PUMP_SODIUM_BICARB, "pH LOW: Adding Sodium Bicarbonate", data);
+    return;
+  } else if (data.pH > TARGET_PH_H) {
+    Actuate_Pump_Adaptive_EA_DL(PUMP_CITRIC_ACID, "pH HIGH: Adding Citric Acid", data);
+    return;
+  }
+
+  // Priority 2: EC
+  if (data.EC_mS < TARGET_EC_L) {
+    if (data.pH < TARGET_PH_H - 0.1) {
+      Actuate_Pump_Adaptive_EA_DL(PUMP_SPIRULINA, "EC LOW: Adding Spirulina (also raises pH)", data);
+    } else {
+      Actuate_Pump_Adaptive_EA_DL(PUMP_URINE, "EC LOW: Adding Urine", data);
+    }
+    return;
+  } else if (data.EC_mS > TARGET_EC_H) {
+    Actuate_Pump_Adaptive_EA_DL(PUMP_DEIONIZED_WATER, "EC HIGH: Adding DI Water (to lower EC)", data);
+    return;
+  }
+
+  // Priority 3: ORP
+  if (data.ORP_mV < TARGET_ORP_L) {
+    Actuate_Pump_Adaptive_EA_DL(PUMP_DEIONIZED_WATER, "ORP LOW: Adding DI Water (raise ORP)", data);
+    return;
+  } else if (data.ORP_mV > TARGET_ORP_H) {
+    Actuate_Pump_Adaptive_EA_DL(PUMP_MOLASSES, "ORP HIGH: Adding Molasses (lower ORP)", data);
+    return;
+  }
+
+  Serial.println("System is Stable. No Dosing Required.");
+}
+
+// ======================================================
+// EA + DL-stub actuator + baseline auto-tune (+1s / -1s behavior)
+// ======================================================
+int pumpIndexFromPin(int pumpPin) {
+  for (int i = 0; i < PUMP_COUNT; i++) {
+    if (pumpPins[i] == pumpPin) return i;
+  }
+  return -1;
+}
+
+void Actuate_Pump_Adaptive_EA_DL(int pumpPin, const char* message, const SensorData& before) {
+  int idx = pumpIndexFromPin(pumpPin);
+  if (idx < 0) {
+    Serial.println("ERROR: Unknown pump pin!");
+    return;
+  }
+
+  Serial.print("DOSING: ");
+  Serial.println(message);
+
+  // EA chooses pulse length using DL-stub "simulator"
+  unsigned long chosenPulse = choosePulse_EA(pumpPin, before);
+
+  // Update baseline to what EA chose (then post-dose tuning nudges it +/- 1s)
+  pumpPulseMs[idx] = chosenPulse;
+
+  Serial.print("EA chose pulse (ms): ");
+  Serial.println(chosenPulse);
+
+  // Dose
+  digitalWrite(pumpPin, HIGH);
+  delay(chosenPulse);
+  digitalWrite(pumpPin, LOW);
+
+  Serial.println("DOSING COMPLETE. Waiting for mixing...");
+  delay(POST_DOSE_MIX_MS);
+
+  // Re-read and evaluate effect
+  SensorData after = readSensors();
+
+  float dPH  = fabs(after.pH     - before.pH);
+  float dEC  = fabs(after.EC_mS  - before.EC_mS);
+  float dORP = fabs(after.ORP_mV - before.ORP_mV);
+
+  Serial.print("Effect | dPH: ");  Serial.print(dPH, 3);
+  Serial.print(" dEC: ");          Serial.print(dEC, 3);
+  Serial.print(" dORP: ");         Serial.println(dORP, 1);
+
+  // Your requested rule: if no/low change across ALL variables => +1s; if too big in ANY => -1s
+  bool tooSmall = (dPH < MIN_PH_DELTA) && (dEC < MIN_EC_DELTA) && (dORP < MIN_ORP_DELTA);
+  bool tooBig   = (dPH > MAX_PH_DELTA) || (dEC > MAX_EC_DELTA) || (dORP > MAX_ORP_DELTA);
+
+  if (tooSmall) {
+    unsigned long old = pumpPulseMs[idx];
+    unsigned long next = old + PULSE_STEP_MS;
+    pumpPulseMs[idx] = constrain(next, PULSE_MIN_MS, PULSE_MAX_MS);
+
+    Serial.print("AUTO-TUNE: Too small/no response -> baseline pulse +1s: ");
+    Serial.print(old);
+    Serial.print(" -> ");
+    Serial.println(pumpPulseMs[idx]);
+  } else if (tooBig) {
+    unsigned long old = pumpPulseMs[idx];
+    long next = (long)old - (long)PULSE_STEP_MS;
+    if (next < (long)PULSE_MIN_MS) next = (long)PULSE_MIN_MS;
+    if (next > (long)PULSE_MAX_MS) next = (long)PULSE_MAX_MS;
+    pumpPulseMs[idx] = (unsigned long)next;
+
+    Serial.print("AUTO-TUNE: Too big response -> baseline pulse -1s: ");
+    Serial.print(old);
+    Serial.print(" -> ");
+    Serial.println(pumpPulseMs[idx]);
+  } else {
+    Serial.println("AUTO-TUNE: Response OK -> baseline unchanged.");
+  }
+
+  // CSV-ish log line (handy if you later train a real NN off-device)
+  Serial.print("LOG,pumpPin="); Serial.print(pumpPin);
+  Serial.print(",pulseMs=");    Serial.print(chosenPulse);
+  Serial.print(",pH0=");        Serial.print(before.pH, 3);
+  Serial.print(",EC0=");        Serial.print(before.EC_mS, 3);
+  Serial.print(",ORP0=");       Serial.print(before.ORP_mV, 1);
+  Serial.print(",pH1=");        Serial.print(after.pH, 3);
+  Serial.print(",EC1=");        Serial.print(after.EC_mS, 3);
+  Serial.print(",ORP1=");       Serial.print(after.ORP_mV, 1);
+  Serial.print(",dPH=");        Serial.print(after.pH - before.pH, 3);
+  Serial.print(",dEC=");        Serial.print(after.EC_mS - before.EC_mS, 3);
+  Serial.print(",dORP=");       Serial.println(after.ORP_mV - before.ORP_mV, 1);
+}
+
+// ======================================================
+// DL predictor stub (replace later with TensorFlow Lite Micro inference)
+// Input: current sensors + pump + pulse
+// Output: predicted deltas (ΔpH, ΔEC, ΔORP)
+// ======================================================
+SensorData predictDelta_DL_stub(int pumpPin, unsigned long pulseMs, const SensorData& s) {
+  (void)s; // unused in stub (real NN would use it)
+  SensorData d{0, 0, 0, 0};
+
+  float k = (float)pulseMs / 1000.0f; // scale with seconds
+
+  if (pumpPin == PUMP_SODIUM_BICARB)   { d.pH = +0.05f * k; d.EC_mS = +0.08f * k; }
+  else if (pumpPin == PUMP_CITRIC_ACID){ d.pH = -0.05f * k; d.EC_mS = +0.01f * k; }
+  else if (pumpPin == PUMP_DEIONIZED_WATER){ d.EC_mS = -0.10f * k; d.ORP_mV = +8.0f * k; d.pH = -0.01f * k; }
+  else if (pumpPin == PUMP_MOLASSES)   { d.ORP_mV = -15.0f * k; d.EC_mS = +0.06f * k; }
+  else if (pumpPin == PUMP_URINE)      { d.EC_mS = +0.10f * k; d.pH = +0.02f * k; d.ORP_mV = -5.0f * k; }
+  else if (pumpPin == PUMP_SPIRULINA)  { d.EC_mS = +0.08f * k; d.pH = +0.03f * k; }
+
+  return d;
+}
+
+// ======================================================
+// Fitness cost: lower is better (stay inside target ranges + avoid lethal EC)
+// ======================================================
+static float clampPenalty(float x, float lo, float hi) {
+  if (x < lo) return (lo - x);
+  if (x > hi) return (x - hi);
+  return 0.0f;
+}
+
+float fitnessCost(const SensorData& predicted) {
+  float cost = 0.0f;
+
+  // weights: pH is tight, EC moderate, ORP looser (tune as needed)
+  cost += 10.0f * clampPenalty(predicted.pH,     TARGET_PH_L,  TARGET_PH_H);
+  cost +=  5.0f * clampPenalty(predicted.EC_mS,  TARGET_EC_L,  TARGET_EC_H);
+  cost +=  1.0f * clampPenalty(predicted.ORP_mV, TARGET_ORP_L, TARGET_ORP_H);
+
+  // hard safety
+  if (predicted.EC_mS > CRITICAL_EC_H) cost += 10000.0f;
+
+  return cost;
+}
+
+// ======================================================
+// EA: choose pulse time by sampling candidates and evolving toward lowest cost
+// (small population + few generations so it runs fast on Arduino)
+// ======================================================
+unsigned long choosePulse_EA(int pumpPin, const SensorData& current) {
+  const int POP  = 10;
+  const int GENS = 4;
+
+  unsigned long cand[POP];
+  float score[POP];
+
+  // base around the pump's baseline
+  unsigned long base = 1000;
+  int idx = pumpIndexFromPin(pumpPin);
+  if (idx >= 0) base = pumpPulseMs[idx];
+
+  // init population near base
+  for (int i = 0; i < POP; i++) {
+    long jitter = (long)random(-3, 4) * 500; // +/-1500ms in 500ms steps
+    long v = (long)base + jitter;
+    if (v < (long)PULSE_MIN_MS) v = (long)PULSE_MIN_MS;
+    if (v > (long)PULSE_MAX_MS) v = (long)PULSE_MAX_MS;
+    cand[i] = (unsigned long)v;
+  }
+
+  for (int g = 0; g < GENS; g++) {
+    // evaluate
+    for (int i = 0; i < POP; i++) {
+      SensorData d = predictDelta_DL_stub(pumpPin, cand[i], current);
+      SensorData pred = current;
+      pred.pH     += d.pH;
+      pred.EC_mS  += d.EC_mS;
+      pred.ORP_mV += d.ORP_mV;
+      score[i] = fitnessCost(pred);
+    }
+
+    // pick best two
+    int b1 = 0, b2 = 1;
+    if (score[b2] < score[b1]) { int t=b1; b1=b2; b2=t; }
+    for (int i = 2; i < POP; i++) {
+      if (score[i] < score[b1]) { b2 = b1; b1 = i; }
+      else if (score[i] < score[b2]) { b2 = i; }
+    }
+
+    unsigned long elite1 = cand[b1];
+    unsigned long elite2 = cand[b2];
+
+    // keep elites
+    cand[0] = elite1;
+    cand[1] = elite2;
+
+    // breed/mutate rest near elites
+    for (int i = 2; i < POP; i++) {
+      unsigned long parent = (random(0, 2) == 0) ? elite1 : elite2;
+      long mut = (long)random(-4, 5) * 250; // +/-1000ms in 250ms steps
+      long v = (long)parent + mut;
+      if (v < (long)PULSE_MIN_MS) v = (long)PULSE_MIN_MS;
+      if (v > (long)PULSE_MAX_MS) v = (long)PULSE_MAX_MS;
+      cand[i] = (unsigned long)v;
+    }
+  }
+
+  // final best
+  unsigned long bestPulse = cand[0];
+  float bestScore = 1e9;
+
+  for (int i = 0; i < POP; i++) {
+    SensorData d = predictDelta_DL_stub(pumpPin, cand[i], current);
+    SensorData pred = current;
+    pred.pH     += d.pH;
+    pred.EC_mS  += d.EC_mS;
+    pred.ORP_mV += d.ORP_mV;
+
+    float s = fitnessCost(pred);
+    if (s < bestScore) {
+      bestScore = s;
+      bestPulse = cand[i];
+    }
+  }
+
+  return bestPulse;
+}
