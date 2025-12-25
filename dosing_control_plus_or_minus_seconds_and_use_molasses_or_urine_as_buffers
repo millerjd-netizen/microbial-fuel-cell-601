@@ -1,0 +1,485 @@
+#include <math.h>  // fabs()
+
+// Adaptive Dosing Control Logic with Buffer Preference Learning
+// Arduino GIGA R1
+// ======================================================
+// This version gradually shifts pH control from direct buffers
+// (sodium bicarbonate/citric acid) to indirect buffers (urine/molasses)
+// which provide nutrients AND pH buffering.
+
+// ------------ Pump Pins (Active HIGH) ------------
+const int PUMP_SODIUM_BICARB   = 2; // Direct pH UP (backup)
+const int PUMP_CITRIC_ACID     = 3; // Direct pH DOWN (backup)
+const int PUMP_DEIONIZED_WATER = 4; // For lowering EC / raising ORP
+const int PUMP_MOLASSES        = 5; // Indirect pH DOWN + lowers ORP + raises EC
+const int PUMP_URINE           = 6; // Indirect pH UP + raises EC
+const int PUMP_SPIRULINA       = 7; // For raising EC / pH (Nutrient)
+
+const unsigned long DOSING_INTERVAL_MS = 300000; // 5 minutes
+
+// ------------ Sensor Pins ------------
+const int PH_PIN   = A0;
+const int ORP_PIN  = A1;
+const int EC_PIN   = A2;
+const int MFC_PIN  = A3;
+
+// ------------ System Target Ranges ------------
+const float TARGET_PH_L = 6.8;
+const float TARGET_PH_H = 7.2;
+const float TARGET_EC_L = 4.0;  // mS/cm
+const float TARGET_EC_H = 5.0;  // mS/cm
+const float CRITICAL_EC_H = 10.0; // Safety limit
+
+const float TARGET_ORP_L = -250.0; // mV (most negative)
+const float TARGET_ORP_H = -150.0; // mV (least negative)
+
+// ------------ Calibration Constants ------------
+const float VREF = 3.3;
+const int   ADC_MAX = 4095;
+
+const float PH_SLOPE     = -5.59047;
+const float PH_INTERCEPT = 15.835;
+
+const float EC_SLOPE_MSPERMV = 0.00864;
+const float EC_OFFSET_MS     = 0.033;
+
+const float ORP_OFFSET = -1524.0;
+const int ORP_OVERSAMPLES = 50;
+
+// ------------ Timing Variables ------------
+unsigned long lastDosingTime = 0;
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_INTERVAL = 5000;
+
+// ======================================================
+// BUFFER PREFERENCE SYSTEM
+// ======================================================
+// Preference value: 0.0 = always use direct buffers
+//                   1.0 = always try indirect buffers first
+// Starts at 0.0 and slowly increases as indirect buffers prove effective
+
+float indirectBufferPreference = 0.0;  // Start conservative
+
+// Learning rates
+const float PREFERENCE_LEARN_UP   = 0.05;  // Increase preference when indirect works
+const float PREFERENCE_LEARN_DOWN = 0.10;  // Decrease faster when indirect fails (safety)
+const float PREFERENCE_DECAY      = 0.002; // Slow decay toward trying indirect again
+
+// Thresholds for deciding buffer strategy
+const float PREFER_INDIRECT_THRESHOLD = 0.3;  // Above this, try indirect first
+const float FORCE_DIRECT_THRESHOLD    = 0.1;  // Below this, always use direct
+
+// Track consecutive failures of indirect buffering
+int indirectFailCount = 0;
+const int MAX_INDIRECT_FAILS = 3;  // After 3 fails, force direct buffer
+
+// pH deviation thresholds for buffer selection
+const float MILD_PH_DEVIATION   = 0.3;  // Within 0.3 of target = mild, try indirect
+const float SEVERE_PH_DEVIATION = 0.6;  // Beyond 0.6 = severe, use direct
+
+// ======================================================
+struct SensorData {
+  float pH;
+  float EC_mS;
+  float ORP_mV;
+  float MFC_mV;
+};
+
+// ======================================================
+// Pump Configuration
+// ======================================================
+const int PUMP_COUNT = 6;
+
+const int pumpPins[PUMP_COUNT] = {
+  PUMP_SODIUM_BICARB,
+  PUMP_CITRIC_ACID,
+  PUMP_DEIONIZED_WATER,
+  PUMP_MOLASSES,
+  PUMP_URINE,
+  PUMP_SPIRULINA
+};
+
+unsigned long pumpPulseMs[PUMP_COUNT] = {1000, 1000, 1000, 1000, 1000, 1000};
+
+const unsigned long PULSE_STEP_MS = 1000;
+const unsigned long PULSE_MIN_MS  = 500;
+const unsigned long PULSE_MAX_MS  = 8000;
+
+const unsigned long POST_DOSE_MIX_MS = 20000;
+
+const float MIN_PH_DELTA  = 0.02;
+const float MIN_EC_DELTA  = 0.02;
+const float MIN_ORP_DELTA = 5.0;
+
+const float MAX_PH_DELTA  = 0.15;
+const float MAX_EC_DELTA  = 0.30;
+const float MAX_ORP_DELTA = 40.0;
+
+// ------------ Forward Declarations ------------
+SensorData readSensors();
+void readAndPrintSensors();
+void executeControlLogic();
+int  pumpIndexFromPin(int pumpPin);
+void Actuate_Pump_Adaptive(int pumpPin, const char* message, const SensorData& before);
+bool tryIndirectpHUp(const SensorData& data);
+bool tryIndirectpHDown(const SensorData& data);
+void updateBufferPreference(bool success, float phChange, float targetDirection);
+
+// ======================================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("Starting Adaptive Dosing Control with Buffer Learning...");
+  Serial.println("System will gradually shift to urine/molasses as primary pH buffers.");
+  Serial.print("Initial indirect buffer preference: ");
+  Serial.println(indirectBufferPreference, 2);
+
+  analogReadResolution(12);
+
+  pinMode(PUMP_SODIUM_BICARB, OUTPUT);
+  pinMode(PUMP_CITRIC_ACID, OUTPUT);
+  pinMode(PUMP_DEIONIZED_WATER, OUTPUT);
+  pinMode(PUMP_MOLASSES, OUTPUT);
+  pinMode(PUMP_URINE, OUTPUT);
+  pinMode(PUMP_SPIRULINA, OUTPUT);
+
+  digitalWrite(PUMP_SODIUM_BICARB, LOW);
+  digitalWrite(PUMP_CITRIC_ACID, LOW);
+  digitalWrite(PUMP_DEIONIZED_WATER, LOW);
+  digitalWrite(PUMP_MOLASSES, LOW);
+  digitalWrite(PUMP_URINE, LOW);
+  digitalWrite(PUMP_SPIRULINA, LOW);
+
+  lastDosingTime = millis() - DOSING_INTERVAL_MS;
+}
+
+// ======================================================
+void loop() {
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastSensorRead >= SENSOR_INTERVAL) {
+    readAndPrintSensors();
+    lastSensorRead = currentTime;
+  }
+
+  if (currentTime - lastDosingTime >= DOSING_INTERVAL_MS) {
+    executeControlLogic();
+    lastDosingTime = currentTime;
+  }
+}
+
+// ======================================================
+SensorData readSensors() {
+  SensorData data;
+
+  int ph_raw = analogRead(PH_PIN);
+  float ph_voltage = ph_raw * (VREF / ADC_MAX);
+  data.pH = PH_SLOPE * ph_voltage + PH_INTERCEPT;
+
+  long sum = 0;
+  for (int i = 0; i < ORP_OVERSAMPLES; i++) {
+    sum += analogRead(ORP_PIN);
+    delayMicroseconds(100);
+  }
+  float orp_raw = sum / (float)ORP_OVERSAMPLES;
+  float orp_mV = (orp_raw * VREF / ADC_MAX) * 1000.0;
+  data.ORP_mV = orp_mV + ORP_OFFSET;
+
+  int ec_raw = analogRead(EC_PIN);
+  float ec_mV = (float)ec_raw * 3300.0 / 4095.0;
+  data.EC_mS = EC_SLOPE_MSPERMV * ec_mV + EC_OFFSET_MS;
+
+  int mfc_raw = analogRead(MFC_PIN);
+  data.MFC_mV = (float)mfc_raw * 3300.0 / 4095.0;
+
+  return data;
+}
+
+void readAndPrintSensors() {
+  SensorData data = readSensors();
+  Serial.print("pH: ");
+  Serial.print(data.pH, 2);
+  Serial.print(" | ORP: ");
+  Serial.print(data.ORP_mV, 1);
+  Serial.print(" | EC: ");
+  Serial.print(data.EC_mS, 3);
+  Serial.print(" | MFC: ");
+  Serial.print(data.MFC_mV, 1);
+  Serial.print(" | BufferPref: ");
+  Serial.println(indirectBufferPreference, 2);
+}
+
+// ======================================================
+// BUFFER PREFERENCE LEARNING
+// ======================================================
+void updateBufferPreference(bool success, float phChange, float targetDirection) {
+  // targetDirection: +1 if we wanted pH UP, -1 if we wanted pH DOWN
+  // phChange: actual change observed
+  
+  bool correctDirection = (targetDirection > 0 && phChange > 0) || 
+                          (targetDirection < 0 && phChange < 0);
+  
+  if (success && correctDirection && fabs(phChange) >= MIN_PH_DELTA) {
+    // Indirect buffer worked! Increase preference
+    indirectBufferPreference += PREFERENCE_LEARN_UP;
+    indirectFailCount = 0;
+    Serial.print("LEARN: Indirect buffer SUCCESS. Preference -> ");
+  } else if (!correctDirection || fabs(phChange) < MIN_PH_DELTA * 0.5) {
+    // Indirect buffer failed or moved wrong direction
+    indirectBufferPreference -= PREFERENCE_LEARN_DOWN;
+    indirectFailCount++;
+    Serial.print("LEARN: Indirect buffer FAILED. Preference -> ");
+  }
+  
+  // Clamp to valid range
+  indirectBufferPreference = constrain(indirectBufferPreference, 0.0, 1.0);
+  Serial.println(indirectBufferPreference, 2);
+}
+
+void decayPreferenceTowardIndirect() {
+  // Slowly encourage trying indirect again over time
+  if (indirectBufferPreference < 0.5) {
+    indirectBufferPreference += PREFERENCE_DECAY;
+    indirectBufferPreference = constrain(indirectBufferPreference, 0.0, 1.0);
+  }
+}
+
+// ======================================================
+// INDIRECT pH CONTROL ATTEMPTS
+// ======================================================
+bool tryIndirectpHUp(const SensorData& before) {
+  // Use URINE to raise pH (also raises EC)
+  // Only attempt if EC isn't already too high
+  
+  if (before.EC_mS > TARGET_EC_H - 0.5) {
+    Serial.println("INDIRECT pH UP: Skipped - EC too high for urine");
+    return false;
+  }
+  
+  Serial.println("INDIRECT pH UP: Trying URINE (raises pH + adds nutrients)");
+  
+  Actuate_Pump_Adaptive(PUMP_URINE, "Indirect pH UP via Urine", before);
+  
+  SensorData after = readSensors();
+  float phChange = after.pH - before.pH;
+  
+  updateBufferPreference(phChange > MIN_PH_DELTA, phChange, +1.0);
+  
+  return (phChange > MIN_PH_DELTA);
+}
+
+bool tryIndirectpHDown(const SensorData& before) {
+  // Use MOLASSES to lower pH (also lowers ORP, raises EC)
+  // Only attempt if EC isn't already too high and ORP isn't too low
+  
+  if (before.EC_mS > TARGET_EC_H - 0.5) {
+    Serial.println("INDIRECT pH DOWN: Skipped - EC too high for molasses");
+    return false;
+  }
+  
+  if (before.ORP_mV < TARGET_ORP_L + 20.0) {
+    Serial.println("INDIRECT pH DOWN: Skipped - ORP already very low");
+    return false;
+  }
+  
+  Serial.println("INDIRECT pH DOWN: Trying MOLASSES (lowers pH + feeds microbes)");
+  
+  Actuate_Pump_Adaptive(PUMP_MOLASSES, "Indirect pH DOWN via Molasses", before);
+  
+  SensorData after = readSensors();
+  float phChange = after.pH - before.pH;
+  
+  updateBufferPreference(phChange < -MIN_PH_DELTA, phChange, -1.0);
+  
+  return (phChange < -MIN_PH_DELTA);
+}
+
+// ======================================================
+// MAIN CONTROL LOGIC
+// ======================================================
+void executeControlLogic() {
+  SensorData data = readSensors();
+
+  Serial.println("--- Starting Dosing Check ---");
+  Serial.print("Buffer Preference: ");
+  Serial.print(indirectBufferPreference, 2);
+  Serial.print(" (");
+  if (indirectBufferPreference >= PREFER_INDIRECT_THRESHOLD) {
+    Serial.println("favoring indirect)");
+  } else {
+    Serial.println("favoring direct)");
+  }
+
+  // Slowly decay toward trying indirect buffers
+  decayPreferenceTowardIndirect();
+
+  // CRITICAL SAFETY CHECK
+  if (data.EC_mS > CRITICAL_EC_H) {
+    Serial.println("!!! CRITICAL EC WARNING - HALTING ALL DOSING !!!");
+    return;
+  }
+
+  // ========== pH CONTROL (Priority 1) ==========
+  float phMidpoint = (TARGET_PH_L + TARGET_PH_H) / 2.0;
+  float phDeviation = fabs(data.pH - phMidpoint);
+  
+  if (data.pH < TARGET_PH_L) {
+    // pH is LOW - need to raise it
+    Serial.print("pH LOW (");
+    Serial.print(data.pH, 2);
+    Serial.print(") - deviation: ");
+    Serial.println(phDeviation, 2);
+    
+    bool useIndirect = false;
+    
+    // Decide whether to try indirect first
+    if (phDeviation < MILD_PH_DEVIATION && 
+        indirectBufferPreference >= PREFER_INDIRECT_THRESHOLD &&
+        indirectFailCount < MAX_INDIRECT_FAILS) {
+      useIndirect = true;
+    }
+    
+    if (useIndirect) {
+      if (tryIndirectpHUp(data)) {
+        Serial.println("Indirect pH UP successful!");
+        return;
+      } else {
+        Serial.println("Indirect pH UP insufficient - falling back to direct buffer");
+      }
+    }
+    
+    // Direct buffer (sodium bicarbonate)
+    Actuate_Pump_Adaptive(PUMP_SODIUM_BICARB, "DIRECT pH UP: Sodium Bicarbonate", data);
+    return;
+    
+  } else if (data.pH > TARGET_PH_H) {
+    // pH is HIGH - need to lower it
+    Serial.print("pH HIGH (");
+    Serial.print(data.pH, 2);
+    Serial.print(") - deviation: ");
+    Serial.println(phDeviation, 2);
+    
+    bool useIndirect = false;
+    
+    if (phDeviation < MILD_PH_DEVIATION && 
+        indirectBufferPreference >= PREFER_INDIRECT_THRESHOLD &&
+        indirectFailCount < MAX_INDIRECT_FAILS) {
+      useIndirect = true;
+    }
+    
+    if (useIndirect) {
+      if (tryIndirectpHDown(data)) {
+        Serial.println("Indirect pH DOWN successful!");
+        return;
+      } else {
+        Serial.println("Indirect pH DOWN insufficient - falling back to direct buffer");
+      }
+    }
+    
+    // Direct buffer (citric acid)
+    Actuate_Pump_Adaptive(PUMP_CITRIC_ACID, "DIRECT pH DOWN: Citric Acid", data);
+    return;
+  }
+
+  // ========== EC CONTROL (Priority 2) ==========
+  if (data.EC_mS < TARGET_EC_L) {
+    // EC is low - can use urine or spirulina
+    // Choose based on current pH to help maintain balance
+    if (data.pH < phMidpoint) {
+      // pH is on low side, use spirulina or urine (both raise pH)
+      Actuate_Pump_Adaptive(PUMP_SPIRULINA, "EC LOW: Spirulina (also helps pH)", data);
+    } else {
+      // pH is on high side or centered, use urine (raises EC, raises pH less aggressively)
+      Actuate_Pump_Adaptive(PUMP_URINE, "EC LOW: Urine", data);
+    }
+    return;
+  } else if (data.EC_mS > TARGET_EC_H) {
+    Actuate_Pump_Adaptive(PUMP_DEIONIZED_WATER, "EC HIGH: Diluting with DI Water", data);
+    return;
+  }
+
+  // ========== ORP CONTROL (Priority 3) ==========
+  if (data.ORP_mV < TARGET_ORP_L) {
+    // ORP too negative (too reducing) - add oxygen/dilute
+    Actuate_Pump_Adaptive(PUMP_DEIONIZED_WATER, "ORP LOW: DI Water to raise ORP", data);
+    return;
+  } else if (data.ORP_mV > TARGET_ORP_H) {
+    // ORP not negative enough (oxidizing stress) - add food
+    // This also helps train the system to use molasses for pH down!
+    Actuate_Pump_Adaptive(PUMP_MOLASSES, "ORP HIGH: Molasses to lower ORP", data);
+    
+    // Bonus: if this also improved pH (lowered it when it was high), boost preference
+    SensorData after = readSensors();
+    if (data.pH > phMidpoint && after.pH < data.pH) {
+      indirectBufferPreference += PREFERENCE_LEARN_UP * 0.5;
+      indirectBufferPreference = constrain(indirectBufferPreference, 0.0, 1.0);
+      Serial.println("BONUS LEARN: Molasses for ORP also helped pH balance!");
+    }
+    return;
+  }
+
+  Serial.println("System is Stable. No Dosing Required.");
+}
+
+// ======================================================
+// ADAPTIVE PUMP ACTUATION
+// ======================================================
+int pumpIndexFromPin(int pumpPin) {
+  for (int i = 0; i < PUMP_COUNT; i++) {
+    if (pumpPins[i] == pumpPin) return i;
+  }
+  return -1;
+}
+
+void Actuate_Pump_Adaptive(int pumpPin, const char* message, const SensorData& before) {
+  int idx = pumpIndexFromPin(pumpPin);
+  if (idx < 0) {
+    Serial.println("ERROR: Unknown pump pin!");
+    return;
+  }
+
+  Serial.print("DOSING: ");
+  Serial.println(message);
+  Serial.print("Pulse (ms): ");
+  Serial.println(pumpPulseMs[idx]);
+
+  digitalWrite(pumpPin, HIGH);
+  delay(pumpPulseMs[idx]);
+  digitalWrite(pumpPin, LOW);
+
+  Serial.println("Waiting for mixing...");
+  delay(POST_DOSE_MIX_MS);
+
+  SensorData after = readSensors();
+
+  float dPH  = fabs(after.pH     - before.pH);
+  float dEC  = fabs(after.EC_mS  - before.EC_mS);
+  float dORP = fabs(after.ORP_mV - before.ORP_mV);
+
+  Serial.print("Effect | dPH: ");  Serial.print(dPH, 3);
+  Serial.print("  dEC: ");         Serial.print(dEC, 3);
+  Serial.print("  dORP: ");        Serial.println(dORP, 1);
+
+  bool tooSmall = (dPH < MIN_PH_DELTA) && (dEC < MIN_EC_DELTA) && (dORP < MIN_ORP_DELTA);
+  bool tooBig   = (dPH > MAX_PH_DELTA) || (dEC > MAX_EC_DELTA) || (dORP > MAX_ORP_DELTA);
+
+  if (tooSmall) {
+    unsigned long next = pumpPulseMs[idx] + PULSE_STEP_MS;
+    pumpPulseMs[idx] = constrain(next, PULSE_MIN_MS, PULSE_MAX_MS);
+    Serial.print("ADAPT: Increasing pulse to ");
+    Serial.println(pumpPulseMs[idx]);
+  } else if (tooBig) {
+    long next = (long)pumpPulseMs[idx] - (long)PULSE_STEP_MS;
+    pumpPulseMs[idx] = constrain(next, PULSE_MIN_MS, PULSE_MAX_MS);
+    Serial.print("ADAPT: Decreasing pulse to ");
+    Serial.println(pumpPulseMs[idx]);
+  } else {
+    Serial.println("ADAPT: Pulse OK");
+  }
+
+  Serial.print("POST | pH: ");     Serial.print(after.pH, 2);
+  Serial.print(" ORP: ");          Serial.print(after.ORP_mV, 1);
+  Serial.print(" EC: ");           Serial.print(after.EC_mS, 3);
+  Serial.print(" MFC: ");          Serial.println(after.MFC_mV, 1);
+}
